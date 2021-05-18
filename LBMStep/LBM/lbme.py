@@ -1,0 +1,480 @@
+import numpy as np
+import math
+from numba import cuda
+from numba import float32
+import os
+import multiprocessing
+import concurrent.futures as cf
+from LBM import out_result
+import SharedArray as sa
+
+e = np.array([[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0],
+              [0, 0, 1], [0, 0, -1], [1, 1, 0], [-1, -1, 0], [-1, 1, 0],
+              [1, -1, 0], [1, 0, 1], [-1, 0, -1], [0, 1, 1], [0, -1, -1],
+              [-1, 0, 1], [1, 0, -1], [0, -1, 1], [0, 1, -1]], dtype=np.int8)
+
+w = np.array([1.0 / 3,
+              1.0 / 18, 1.0 / 18, 1.0 / 18, 1.0 / 18, 1.0 / 18, 1.0 / 18,
+              1.0 / 36, 1.0 / 36, 1.0 / 36, 1.0 / 36, 1.0 / 36, 1.0 / 36, 1.0 / 36, 1.0 / 36,
+              1.0 / 36, 1.0 / 36, 1.0 / 36, 1.0 / 36], dtype=np.float32)
+
+opp = np.array([0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15, 18, 17], dtype=np.int8)
+
+opp2 = np.array([0, 1, 2, 4, 3, 5, 6, 10, 9, 8, 7, 11, 12, 17, 18, 15, 16, 13, 14], dtype=np.int8)
+
+
+def propagate_start(ft1, ft2, blockspergrid, threadsperblock, gpu_id, end
+                    , dia_u_lb, out_u_lb, tau_inv):
+
+    @cuda.jit('void(uint16[:,:,:], uint16[:,:,:], uint16[:,:,:], uint16[:,:,:], float32, float32, int32)')
+    def propagate_kernel(ftemp, dcur, dabove, dbelow, tau_inv, v, flag):
+
+        # set constant array of direction vectors
+        de = cuda.const.array_like(e)
+        # set constant array of opposite direction indices
+        dopp = cuda.const.array_like(opp)
+
+        dopp2 = cuda.const.array_like(opp2)
+
+        dw = cuda.const.array_like(w)
+        # obtain position in grid
+        x, y = cuda.grid(2)
+
+        # if within domain and  not solid node
+        if x < dcur.shape[0] and y < dcur.shape[1]:
+
+            if dcur[x, y, 0] > 0:
+
+                ftemp[x, y, 0] = dcur[x, y, 0]
+
+                for i in range(1, 19):
+
+                    # obtain original position of f distribution
+                    xi = x + de[i, 1]
+                    yi = y - de[i, 2]
+
+                    if yi == -1:
+                        yi = dcur.shape[1] - 1
+                    elif yi == dcur.shape[1]:
+                        yi = 0
+
+                    # if from current layer
+                    if de[i, 0] == 0:
+
+                        if dcur[xi, yi, 0] == 0 or xi == dcur.shape[0]:
+                            j = dopp[i]
+                            ftemp[x, y, i] = dcur[x, y, j]
+                        elif xi == -1:
+                            j = dopp2[i]
+                            ftemp[x, y, i] = dcur[x, yi, j]
+                        else:
+                            ftemp[x, y, i] = dcur[xi, yi, i]
+
+                    # if from layer below
+                    elif de[i, 0] > 0:
+
+                        if dbelow[xi, yi, 0] == 0 or xi == dcur.shape[0]:
+                            j = dopp[i]
+                            ftemp[x, y, i] = dcur[x, y, j]
+                        elif xi == -1:
+                            j = dopp2[i]
+                            ftemp[x, y, i] = dbelow[x, yi, j]
+                        else:
+                            ftemp[x, y, i] = dbelow[xi, yi, i]
+                    # if from layer above
+                    elif de[i, 0] < 0:
+
+                        if dabove[xi, yi, 0] == 0 or xi == dcur.shape[0]:
+                            j = dopp[i]
+                            ftemp[x, y, i] = dcur[x, y, j]
+                        elif xi == -1:
+                            j = dopp2[i]
+                            ftemp[x, y, i] = dabove[x, yi, j]
+                        else:
+                            ftemp[x, y, i] = dabove[xi, yi, i]
+
+                f = cuda.local.array(19, dtype=float32)
+
+                rho = 0.0
+
+                if flag == 0:
+
+                    for i in range(19):
+                        f[i] = ftemp[x, y, i] / 30000 * dw[i]
+                        rho += f[i]
+                elif flag == 2:
+
+                    for i in range(19):
+                        f[i] = ftemp[x, y, i] / 30000 * dw[i]
+                        rho += f[i]
+
+                    if x == ftemp.shape[0] - 1:
+
+                        ro = 0.0
+                        for i in range(19):
+                            ro += dcur[x, y, i] / 30000 * dw[i]
+
+                        b = 6 * ro * v / 36.0
+
+                        f[3] += 6 * ro * v / 18.0
+                        f[7] += b
+                        f[9] += b
+                        f[13] += b
+                        f[18] += b
+                        rho += ro * v
+
+                else:
+
+                    for i in range(19):
+                        f[i] = ftemp[x, y, i] / 30000 * dw[i]
+
+                    ru = (f[0] + f[3] + f[4] + f[5] + f[6] + f[13] + f[14] + f[17] + f[18]
+                          + 2 * (f[2] + f[8] + f[9] + f[12] + f[15])) / (1 - v) * v
+
+                    f[1] = f[2] + ru / 3
+
+                    diff_3_4 = f[3] - f[4]
+
+                    diff_13_14 = f[13] - f[14]
+
+                    diff_18_17 = f[18] - f[17]
+
+                    diff_5_6 = f[5] - f[6]
+
+                    f[7] = f[8] + ru / 6 - (diff_3_4 + diff_13_14 + diff_18_17) / 2
+
+                    f[10] = f[9] + ru / 6 + (diff_3_4 + diff_13_14 + diff_18_17) / 2
+
+                    f[11] = f[12] + ru / 6 - (diff_5_6 + diff_13_14 - diff_18_17) / 2
+
+                    f[16] = f[15] + ru / 6 + (diff_5_6 + diff_13_14 - diff_18_17) / 2
+
+                    for i in range(19):
+                        rho += f[i]
+
+                vx = (f[1] - f[2] + f[7] - f[8] + f[10] - f[9] + f[11] - f[12] + f[16] - f[15]) / rho
+
+                vy = (f[3] - f[4] + f[7] - f[8] + f[9] - f[10] + f[13] - f[14] + f[18] - f[17]) / rho
+
+                vz = (f[5] - f[6] + f[11] - f[12] + f[13] - f[14] + f[15] - f[16] + f[17] - f[18]) / rho
+
+                # calculate feq and f after collision
+
+                square = 1.5 * (vx * vx + vy * vy + vz * vz)
+
+                f[0] += (dw[0] * rho * (1 - square) - f[0]) * tau_inv
+
+                feq1 = dw[1] * rho * (1.0 + 3.0 * vx + 4.5 * vx * vx - square)
+
+                f[1] += (feq1 - f[1]) * tau_inv
+
+                f[2] += (feq1 - 6.0 * dw[1] * rho * vx - f[2]) * tau_inv
+
+                feq3 = dw[3] * rho * (1.0 + 3.0 * vy + 4.5 * vy * vy - square)
+
+                f[3] += (feq3 - f[3]) * tau_inv
+
+                f[4] += (feq3 - 6.0 * dw[3] * rho * vy - f[4]) * tau_inv
+
+                feq5 = dw[5] * rho * (1.0 + 3.0 * vz + 4.5 * vz * vz - square)
+
+                f[5] += (feq5 - f[5]) * tau_inv
+
+                f[6] += (feq5 - 6.0 * dw[5] * rho * vz - f[6]) * tau_inv
+
+                sum = vx + vy
+
+                vxy = 2.0 * vx * vy
+
+                vxy2 = vx * vx + vy * vy
+
+                feq7 = dw[7] * rho * (1.0 + 3.0 * sum + 4.5 * (vxy2 + vxy) - square)
+
+                f[7] += (feq7 - f[7]) * tau_inv
+                f[8] += (feq7 - 6.0 * dw[7] * rho * sum - f[8]) * tau_inv
+
+                sum = vy - vx
+
+                feq9 = dw[9] * rho * (1.0 + 3.0 * sum + 4.5 * (vxy2 - vxy) - square)
+
+                f[9] += (feq9 - f[9]) * tau_inv
+                f[10] += (feq9 - 6.0 * dw[9] * rho * sum - f[10]) * tau_inv
+
+                sum = vx + vz
+
+                vxz = 2.0 * vx * vz
+
+                vxz2 = vx * vx + vz * vz
+
+                feq11 = dw[11] * rho * (1.0 + 3.0 * sum + 4.5 * (vxz2 + vxz) - square)
+
+                f[11] += (feq11 - f[11]) * tau_inv
+                f[12] += (feq11 - 6.0 * dw[11] * rho * sum - f[12]) * tau_inv
+
+                sum = vy + vz
+
+                vyz = 2.0 * vy * vz
+
+                vyz2 = vy * vy + vz * vz
+
+                feq13 = dw[13] * rho * (1.0 + 3.0 * sum + 4.5 * (vyz + vyz2) - square)
+
+                f[13] += (feq13 - f[13]) * tau_inv
+                f[14] += (feq13 - 6.0 * dw[13] * rho * sum - f[14]) * tau_inv
+
+                sum = vz - vx
+
+                feq15 = dw[15] * rho * (1.0 + 3.0 * sum + 4.5 * (vxz2 - vxz) - square)
+
+                f[15] += (feq15 - f[15]) * tau_inv
+                f[16] += (feq15 - 6.0 * dw[15] * rho * sum - f[16]) * tau_inv
+
+                sum = vz - vy
+
+                feq17 = dw[17] * rho * (1.0 + 3.0 * sum + 4.5 * (vyz2 - vyz) - square)
+
+                f[17] += (feq17 - f[17]) * tau_inv
+                f[18] += (feq17 - 6.0 * dw[17] * rho * sum - f[18]) * tau_inv
+
+                for i in range(19):
+                    ftemp[x, y, i] = round(f[i] * 30000 / dw[i])
+            else:
+                for i in range(19):
+                    ftemp[x, y, i] = 0
+
+    ftable = sa.attach(ft1)
+    ftable_empty = sa.attach(ft2)
+    cuda.select_device(gpu_id)
+    stream1 = cuda.stream()
+    stream2 = cuda.stream()
+
+    i1 = 205
+    i2 = 595
+    i3 = 799
+    i4 = 800
+
+    st = end - 1
+
+    dabove = cuda.to_device(ftable[1, :500], stream=stream1)
+    dcur = cuda.to_device(ftable[0, :500], stream=stream1)
+    dbelow = dcur
+
+    dtemp = cuda.device_array_like(dcur, stream=stream1)
+
+    propagate_kernel[blockspergrid, threadsperblock, stream1](dtemp, dcur, dabove, dbelow, tau_inv, out_u_lb, 1)
+
+    dnext = cuda.to_device(ftable[2, :500], stream=stream2)
+
+    stream2.synchronize()
+    stream1.synchronize()
+    dtemp.copy_to_host(ftable_empty[0, :500], stream=stream2)
+
+    dbelow = dcur
+    dcur = dabove
+    dabove = dnext
+
+    for i in range(1, end):
+
+        dtemp = cuda.device_array_like(dcur, stream=stream1)
+
+        if i1 < i < i2:
+            propagate_kernel[blockspergrid, threadsperblock, stream1](dtemp, dcur, dabove, dbelow, tau_inv, dia_u_lb, 2)
+
+        else:
+            propagate_kernel[blockspergrid, threadsperblock, stream1](dtemp, dcur, dabove, dbelow, tau_inv, 0, 0)
+
+        if i1 < i+2 < i2:
+            dnext = cuda.to_device(ftable[i + 2, :600], stream=stream2)
+        elif i+2 < i3:
+            dnext = cuda.to_device(ftable[i + 2, :500], stream=stream2)
+        elif i < st:
+            dnext = cuda.to_device(ftable[i + 2], stream=stream2)
+
+        stream2.synchronize()
+        stream1.synchronize()
+        dtemp.copy_to_host(ftable_empty[i, :dtemp.shape[0]], stream=stream2)
+
+        dbelow = dcur
+        dcur = dabove
+        dabove = dnext
+
+    stream2.synchronize()
+
+
+# thread function to handle streaming step
+def propagate(ft1, ft2, height, blockspergrid, threadsperblock, gpu_id, start, end, tau_inv):
+
+    print("122222", gpu_id)
+
+    # cuda function to initialize f array
+    @cuda.jit('void(uint16[:,:,:], int8[:,:,:], int32, float32)')
+    def initialization_kernel(cur, voxels, h, rho):
+        # dw = cuda.const.array_like(w)
+        x, y = cuda.grid(2)
+
+        if x < voxels.shape[1] and y < voxels.shape[2]:
+            if voxels[h, x, y] >= 0:
+                m = cur.shape[0] - 1 - x
+                for i in range(19):
+                    cur[m, y, i] = round(rho * 30000)
+
+    print("122222", gpu_id)
+    ftable = sa.attach(ft1)
+    ftable_empty = sa.attach(ft2)
+    print("122222", gpu_id)
+    # cuda.select_device(gpu_id)
+    # stream1 = cuda.stream()
+    # stream2 = cuda.stream()
+    #
+    # st = end - 1 if end < height else height - 2
+    #
+    # dabove = cuda.to_device(ftable[start + 1], stream=stream1)
+    # dcur = cuda.to_device(ftable[start], stream=stream1)
+    # dtemp = cuda.device_array_like(ftable_empty[0], stream=stream1)
+    # dbelow = cuda.to_device(ftable[start - 1], stream=stream1)
+    #
+    # for i in range(start, end):
+    #
+    #     propagate_kernel_new[blockspergrid, threadsperblock, stream1](dtemp, dcur, dabove, dbelow, tau_inv)
+    #
+    #     if i < st:
+    #         dnext = cuda.to_device(ftable[i + 2], stream=stream2)
+    #
+    #     stream2.synchronize()
+    #     stream1.synchronize()
+    #     dtemp.copy_to_host(ftable_empty[i], stream=stream2)
+    #
+    #     dtemp = dbelow
+    #     dbelow = dcur
+    #     dcur = dabove
+    #     dabove = dnext
+    #
+    # stream2.synchronize()
+    # stream3.synchronize()
+
+
+def f(name):
+
+    # cuda function to initialize f array
+    @cuda.jit('void(uint16[:,:,:], int8[:,:,:], int32, float32)')
+    def initialization_kernel(cur, voxels, h, rho):
+        # dw = cuda.const.array_like(w)
+        x, y = cuda.grid(2)
+
+        if x < voxels.shape[1] and y < voxels.shape[2]:
+            if voxels[h, x, y] >= 0:
+                m = cur.shape[0] - 1 - x
+                for i in range(19):
+                    cur[m, y, i] = round(rho * 30000)
+
+
+    print('hello1')
+    with cuda.gpus[0]:
+        print('hello', name)
+        print(cuda.gpus.current)
+
+
+def initialization(voxels, ftable, blockspergrid, threadsperblock, rho):
+
+    stream1 = cuda.stream()
+    stream2 = cuda.stream()
+    stream3 = cuda.stream()
+
+    dvoxels = cuda.to_device(voxels, stream=stream1)
+
+    for i in range(voxels.shape[0]):
+
+        if i == 0:
+            dcur = cuda.to_device(ftable[i], stream=stream1)
+
+        else:
+
+            stream2.synchronize()
+            dcur = dnext
+
+        if i < voxels.shape[0] - 1:
+            dnext = cuda.to_device(ftable[i + 1], stream=stream2)
+
+        initialization_kernel[blockspergrid, threadsperblock, stream1](dcur, dvoxels, i, rho)
+        stream1.synchronize()
+        dcur.copy_to_host(ftable[i], stream=stream3)
+
+    stream3.synchronize()
+
+
+def conti(duration, starttime, lu, dia_u_lb_max, out_u_lb, tau_inv, ts, ftable
+          , interval, frequency, dia_delay, out_folder, device_num):
+
+    sa.create("shm://ftable2", ftable.shape, np.uint16)
+
+    ft1 = "ftable1"
+    ft2 = "ftable2"
+
+    # define GPU setting   threads per block  and  blocks per grid   for 1 layer along y axis
+    threadsperblock = (16, 16)
+    blockspergrid_y = math.ceil(ftable.shape[1] / threadsperblock[0])
+    # blockspergrid_y2 = math.ceil(ftable.shape[1] / threadsperblock[0] / 2)
+    blockspergrid_z = math.ceil(ftable.shape[2] / threadsperblock[1])
+    blockspergrid = (blockspergrid_y, blockspergrid_z)
+    # blockspergrid2 = (blockspergrid_y2, blockspergrid_z)
+    print("ready")
+    # initialize time and number of data output
+    t = starttime
+    output_num = starttime // interval
+
+    endtime = duration + starttime
+
+    start = np.zeros(device_num, np.int32)
+    end = np.zeros(device_num, np.int32)
+
+    dia_delay -= ts
+
+    for gpu_id in range(device_num):
+        start[gpu_id] = gpu_id * (ftable.shape[0]) // (device_num)
+        end[gpu_id] = (gpu_id + 1) * (ftable.shape[0]) // (device_num)
+
+    dia_u_lb = 0 if t < dia_delay else dia_u_lb_max * np.sin(2 * np.pi * (t - dia_delay) * frequency)
+
+    while t < endtime:
+        # output data result after specific interval
+        if t >= output_num * interval:
+
+            ftable = sa.attach(ft1)
+
+            output = multiprocessing.Process(target=out_result.output_result, args=(lu, ts,
+                            ftable[:, :, math.floor(ftable.shape[2] / 2), :], out_folder, t))
+            output.start()
+
+            output = multiprocessing.Process(target=out_result.output_result_2, args=(lu, ts,
+                            ftable[:, 750, :, :], out_folder + 'h=750', t))
+
+            output.start()
+
+            output = multiprocessing.Process(target=out_result.output_result_2, args=(lu, ts,
+                            ftable[:, 470, :, :], out_folder + 'h=470', t))
+
+            output.start()
+
+            output = multiprocessing.Process(target=out_result.output_result_2, args=(lu, ts,
+                            ftable[350:550, 500, :, :], out_folder + 'h=500', t))
+
+            output.start()
+
+            output_num += 1
+
+        with cf.ProcessPoolExecutor(max_workers=device_num) as executor:
+            print(ft1, ft2)
+            for i in range(1, device_num):
+                executor.submit(f, i)
+
+            executor.submit(f, 0)
+
+            t += ts
+
+            dia_u_lb = 0 if t < dia_delay else dia_u_lb_max * np.sin(2 * np.pi * (t - dia_delay) * frequency)
+
+            temp = ft1
+
+            ft1 = ft2
+
+            ft2 = temp
